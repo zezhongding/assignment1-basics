@@ -30,6 +30,13 @@ include = ["cs336_basics"]
 package = true
 python-preference = "managed"
 
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+default = true
+ 
+[tool.uv.pip]
+index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "WARNING"
@@ -48,3 +55,4 @@ extend-select = ["UP"]
 ignore = [
     "F722"
 ]
+

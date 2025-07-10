@@ -9,6 +9,60 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
+from collections import Counter
+import regex as re
+
+from typing import BinaryIO
+from typing import List, Dict, Tuple
+from concurrent.futures import ProcessPoolExecutor
+
+def find_chunk_boundaries(
+    file: BinaryIO, 
+    desired_num_chunks: int, 
+    split_special_token: bytes
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
 
 
 def run_linear(
@@ -29,8 +83,7 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    return torch.matmul(in_features, weights.t())
 
 
 def run_embedding(
@@ -52,7 +105,7 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -84,7 +137,12 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+
+    x1 = in_features @ w1_weight.t()
+    x3 = in_features @ w3_weight.t()
+    swiglu = torch.nn.functional.silu(x1) * x3
+    out = swiglu @ w2_weight.t()
+    return out
 
 
 def run_scaled_dot_product_attention(
@@ -105,7 +163,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.size(-1)
+    attn_logits = Q @ K.transpose(-2, -1) / d_k ** 0.5
+    if (mask is not None):
+        attn_logits += mask
+    attn_weights = torch.nn.functional.softmax(attn_logits, dim=-1)
+    attn_output = attn_weights @ V
+    return attn_output     
 
 
 def run_multihead_self_attention(
@@ -131,7 +195,7 @@ def run_multihead_self_attention(
         max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
         q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
         k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
+        v_proj_weight (Float[Tensor, "d_v d_in"]): Weights for the V projection
         o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
         in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
 
@@ -139,7 +203,31 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    Q = in_features @ q_proj_weight.t()
+    K = in_features @ k_proj_weight.t()
+    V = in_features @ v_proj_weight.t()
+    batch_shape = Q.shape[:-1]
+    seq_len = Q.shape[-2]
+    d_k = Q.shape[-1]
+    d_v = V.shape[-1]
+
+    head_dim = d_k // num_heads
+
+    # Reshape for multi-head: (..., seq_len, num_heads, head_dim)
+    Q = Q.view(*batch_shape, seq_len, num_heads, head_dim).transpose(-3, -2)  # (..., num_heads, seq_len, head_dim)
+    K = K.view(*batch_shape, seq_len, num_heads, head_dim).transpose(-3, -2)
+    V = V.view(*batch_shape, seq_len, num_heads, head_dim).transpose(-3, -2)
+
+    # Use run_scaled_dot_product_attention for each head
+    attn_output = run_scaled_dot_product_attention(Q, K, V)  # (..., num_heads, seq_len, head_dim)
+
+    # Merge heads
+    attn_output = attn_output.transpose(-3, -2).contiguous().view(*batch_shape, seq_len, -1)  # (..., seq_len, d_v)
+
+    # Output projection
+    out = attn_output @ o_proj_weight.t()
+    return out
+
 
 
 def run_multihead_self_attention_with_rope(
@@ -552,14 +640,14 @@ def get_tokenizer(
         merges (list[tuple[bytes, bytes]]): BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
             representing that <token1> was merged with <token2>.
             Merges are ordered by order of creation.
-        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never
-            be split into multiple tokens, and will always be kept as a single token.
+        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never be split into multiple tokens, and will always be kept as a single token.
 
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
 
+
+    raise NotImplementedError
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -588,4 +676,282 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    """Train a BPE tokenizer with vocab: [special tokens] + [256 bytes] + [merge tokens]."""
+
+    with open(input_path, "r") as f:
+        text = f.read()
+
+    special_token_map = {}
+    for idx, tok in enumerate(special_tokens):
+        placeholder = f"<@_SPECIAL{idx}_@>"
+        text = text.replace(tok, placeholder)
+        special_token_map[placeholder] = tok
+
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    units = []
+    for part in re.findall(PAT, text):
+        if part in special_token_map:
+            units.append(special_token_map[part])
+        elif part:
+            units.append(part)
+
+    token_seqs = []
+    for unit in units:
+        if unit in special_tokens:
+            token_seqs.append([unit.encode('utf-8')])
+        else:
+            token_seqs.append([bytes([b]) for b in unit.encode('utf-8')])
+
+    # === 构建vocab（special->bytes->merge tokens） ===
+    vocab = {}
+
+    # 1. special tokens
+    for i, tok in enumerate(special_tokens):
+        vocab[i] = tok.encode('utf-8')
+
+    # 2. 256 byte chars，必须补齐全部
+    byte_chars = [bytes([i]) for i in range(256)]
+    for i, b in enumerate(byte_chars):
+        vocab[len(special_tokens) + i] = b
+
+    # 3. 后续的 merge token id 按 vocab 长度递增分配
+    merges: List[Tuple[bytes, bytes]] = []
+
+    # ==== BPE merge循环 ====
+    # 新增的合成token id 从 vocab_offset 往后排
+    vocab_offset = len(vocab)
+    while len(vocab) < vocab_size:
+        pairs = Counter()
+        for seq in token_seqs:
+            # 跳过special token单独unit
+            if len(seq) == 1 and seq[0] in [st.encode('utf-8') for st in special_tokens]:
+                continue
+            for i in range(len(seq) - 1):
+                pair = (seq[i], seq[i + 1])
+                pairs[pair] += 1
+        if not pairs:
+            break
+        
+        max_freq = max(pairs.values())
+        max_pairs = [pair for pair, cnt in pairs.items() if cnt == max_freq]
+        most_common = max(max_pairs)
+
+        merges.append(most_common)
+        merged_token = most_common[0] + most_common[1]
+
+        new_token_seqs = []
+        for seq in token_seqs:
+            if len(seq) == 1 and seq[0] in [st.encode('utf-8') for st in special_tokens]:
+                new_token_seqs.append(seq)
+            else:
+                new_seq = []
+                i = 0
+                while i < len(seq):
+                    if i < len(seq) - 1 and (seq[i], seq[i + 1]) == most_common:
+                        new_seq.append(merged_token)
+                        i += 2
+                    else:
+                        new_seq.append(seq[i])
+                        i += 1
+                new_token_seqs.append(new_seq)
+        token_seqs = new_token_seqs
+
+        if merged_token not in vocab.values():
+            vocab[len(vocab)] = merged_token
+
+    return vocab, merges
+
+# def run_train_bpe(
+#     input_path: str | os.PathLike,
+#     vocab_size: int,
+#     special_tokens: list[str],
+#     **kwargs,
+# ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+#     """Given the path to an input corpus, run train a BPE tokenizer and
+#     output its vocabulary and merges.
+
+#     Args:
+#         input_path (str | os.PathLike): Path to BPE tokenizer training data.
+#         vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+#         special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+#             These strings will never be split into multiple tokens, and will always be
+#             kept as a single token. If these special tokens occur in the `input_path`,
+#             they are treated as any other string.
+
+#     Returns:
+#         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+#             vocab:
+#                 The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+#                 to bytes (token bytes)
+#             merges:
+#                 BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+#                 representing that <token1> was merged with <token2>.
+#                 Merges are ordered by order of creation.
+#     """
+#     """Train a BPE tokenizer with vocab: [special tokens] + [256 bytes] + [merge tokens]."""
+
+
+#     num_processes = 32
+#     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+#     specials_bytes_set = set(st.encode('utf-8') for st in special_tokens)
+
+#     # 1. 切chunk & 处理为token序列
+#     with open(input_path, "rb") as f:
+#         # （你需要实现这个，确保chunk边界不拆special token）
+#         boundaries = find_chunk_boundaries(
+#             f, num_processes, "<|endoftext|>".encode("utf-8"))
+#         chunks = []
+#         for start, end in zip(boundaries[:-1], boundaries[1:]):
+#             f.seek(start)
+#             chunk = f.read(end - start)
+#             chunks.append(chunk)
+
+#     # 并行tokenize（每个chunk为一个token_seq_list）
+#     with ProcessPoolExecutor(max_workers=num_processes) as executor:
+#         token_seqs_blocks = list(executor.map(
+#             process_and_tokenize,
+#             chunks,
+#             [special_tokens]*len(chunks),
+#             [PAT]*len(chunks)
+#         ))
+
+#     # 2. 每一轮 BPE
+#     vocab = {}
+#     for i, tok in enumerate(special_tokens):
+#         vocab[i] = tok.encode('utf-8')
+#     for i in range(256):
+#         vocab[len(special_tokens) + i] = bytes([i])
+#     merges: List[Tuple[bytes, bytes]] = []
+#     next_token_id = len(vocab)
+
+#     # 主循环
+#     while len(vocab) < vocab_size:
+#         # 2.1 多进程统计pair
+#         with ProcessPoolExecutor(max_workers=num_processes) as executor:
+#             results = list(executor.map(
+#                 count_pairs,
+#                 token_seqs_blocks,
+#                 [specials_bytes_set] * len(token_seqs_blocks),
+#             ))
+#         global_pairs = Counter()
+#         for c in results:
+#             global_pairs.update(c)
+
+#         if not global_pairs:
+#             break
+#         # 2.2 选最大出现的pair
+#         max_freq = max(global_pairs.values())
+#         mosts = [k for k, v in global_pairs.items() if v == max_freq]
+#         best_pair = max(mosts)  # 可自由确定tie-break方式
+
+#         merges.append(best_pair)
+#         merged_token = best_pair[0] + best_pair[1]
+#         if merged_token not in vocab.values():
+#             vocab[next_token_id] = merged_token
+#             next_token_id += 1
+
+#         # 2.3 多进程全局同步替换
+#         with ProcessPoolExecutor(max_workers=num_processes) as executor:
+#             token_seqs_blocks = list(executor.map(
+#                 merge_pair_in_chunk,
+#                 token_seqs_blocks,
+#                 [best_pair]*len(token_seqs_blocks),
+#                 [specials_bytes_set]*len(token_seqs_blocks),
+#             ))
+
+#     return vocab, merges
+
+
+
+
+def process_chunk(chunk: bytes, special_tokens: List[str], PAT: str) -> Counter:
+    """对每一个划分的 chunk 统计pair频数，只返回Counter。"""
+    text = chunk.decode("utf-8", errors="ignore")
+
+    # 替换special token为占位
+    special_token_map = {}
+    for idx, tok in enumerate(special_tokens):
+        placeholder = f"<@_SPECIAL{idx}_@>"
+        text = text.replace(tok, placeholder)
+        special_token_map[placeholder] = tok
+
+    # 切分
+    units = []
+    for part in re.findall(PAT, text):
+        if part in special_token_map:
+            units.append(special_token_map[part])
+        elif part:
+            units.append(part)
+
+    # 按bytes分片
+    token_seqs = []
+    for unit in units:
+        if unit in special_tokens:
+            token_seqs.append([unit.encode('utf-8')])
+        else:
+            token_seqs.append([bytes([b]) for b in unit.encode('utf-8')])
+
+    # pair统计
+    pairs = Counter()
+    specials_set = set(st.encode("utf-8") for st in special_tokens)
+    for seq in token_seqs:
+        if len(seq) == 1 and seq[0] in specials_set:
+            continue
+        for i in range(len(seq) - 1):
+            pair = (seq[i], seq[i + 1])
+            pairs[pair] += 1
+
+    return pairs
+
+
+def process_and_tokenize(chunk: bytes, special_tokens: List[str], PAT: str) -> List[List[bytes]]:
+    """对文本块进行分句、分词，转为token序列（list[list[bytes]])"""
+    text = chunk.decode("utf-8", errors="ignore")
+    special_token_map = {}
+    for idx, tok in enumerate(special_tokens):
+        placeholder = f"<@_SPECIAL{idx}_@>"
+        text = text.replace(tok, placeholder)
+        special_token_map[placeholder] = tok
+    units = []
+    for part in re.findall(PAT, text):
+        if part in special_token_map:
+            units.append(special_token_map[part])
+        elif part:
+            units.append(part)
+    token_seqs = []
+    for unit in units:
+        if unit in special_tokens:
+            token_seqs.append([unit.encode("utf-8")])
+        else:
+            token_seqs.append([bytes([b]) for b in unit.encode("utf-8")])
+    return token_seqs
+
+def count_pairs(token_seqs_chunk: List[List[bytes]], specials: set) -> Counter:
+    """统计chunk内pair频率"""
+    pairs = Counter()
+    for seq in token_seqs_chunk:
+        if len(seq) == 1 and seq[0] in specials:
+            continue
+        for i in range(len(seq) - 1):
+            pairs[(seq[i], seq[i+1])] += 1
+    return pairs
+
+def merge_pair_in_chunk(token_seqs_chunk: List[List[bytes]], pair_to_merge: Tuple[bytes,bytes], specials: set) -> List[List[bytes]]:
+    """chunk内部合并最多对"""
+    out = []
+    for seq in token_seqs_chunk:
+        if len(seq) == 1 and seq[0] in specials:
+            out.append(seq)
+            continue
+        new_seq = []
+        i = 0
+        while i < len(seq):
+            if i < len(seq) - 1 and (seq[i], seq[i+1]) == pair_to_merge:
+                new_seq.append(seq[i] + seq[i+1])
+                i += 2
+            else:
+                new_seq.append(seq[i])
+                i += 1
+        out.append(new_seq)
+    return out
