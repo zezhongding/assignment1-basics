@@ -892,7 +892,7 @@ def run_train_bpe(
 
     t1 = time.time()
     print(f"循环内部时间：{t1 - t0:.4f}秒")
-
+    print(f"循环内部时间：{t2 - t0:.4f}秒")
     return vocab, merges
 
 

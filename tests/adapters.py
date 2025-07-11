@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
 from jaxtyping import Float, Int
@@ -16,7 +17,9 @@ from typing import BinaryIO
 from typing import List, Dict, Tuple
 from concurrent.futures import ProcessPoolExecutor
 # from numba import njit
-
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent)) 
+from assign1 import *
 
 def find_chunk_boundaries(
     file: BinaryIO, 
@@ -781,18 +784,18 @@ def bytes_vocab(special_tokens: List[str]) -> Tuple[dict[int, bytes], dict[bytes
 
 def process_and_tokenize(chunk: bytes, special_tokens: List[str], PAT: str, byte2id: dict) -> List[List[int]]:
     text = chunk.decode("utf-8", errors="ignore")
-    for tok in special_tokens:
-        text = text.replace(tok, f"<@_{tok}_@>")
+    # for tok in special_tokens:
+    #     text = text.replace(tok, f"<@_{tok}_@>")
     units = re.findall(PAT, text)
     ids = []
     for u in units:
         if not u:
             continue
         orig = u
-        # 恢复特殊token
-        for st in special_tokens:
-            if u == f"<@_{st}_@>":
-                orig = st
+        # # 恢复特殊token
+        # for st in special_tokens:
+        #     if u == f"<@_{st}_@>":
+        #         orig = st
         if orig in special_tokens:
             b = orig.encode('utf-8')
             tid = byte2id.get(b)
@@ -807,73 +810,181 @@ def process_and_tokenize(chunk: bytes, special_tokens: List[str], PAT: str, byte
 def count_pairs(token_ids_blocks: List[List[int]], special_ids: set[int]) -> Counter:
     c = Counter()
     for block in token_ids_blocks:
-        for i in range(len(block)-1):
-            a, b = block[i], block[i+1]
+        for a, b in zip(block, block[1:]):
             if a in special_ids or b in special_ids:
                 continue
             c[(a, b)] += 1
     return c
 
 def merge_pairs(token_ids_blocks: List[List[int]], pair_to_merge: Tuple[int, int], new_token_id: int, special_ids: set[int]) -> List[List[int]]:
-    res_blocks = []
     a, b = pair_to_merge
     for block in token_ids_blocks:
-        res = []
         i = 0
         while i < len(block):
             if (
-                i < len(block) - 1 and
-                block[i] == a and
-                block[i+1] == b and
-                block[i] not in special_ids and
-                block[i+1] not in special_ids
+                i < len(block) - 1 and 
+                block[i] == a and block[i+1] == b and 
+                block[i] not in special_ids and block[i+1] not in special_ids
             ):
-                res.append(new_token_id)
-                i += 2
-            else:
-                res.append(block[i])
-                i += 1
-        res_blocks.append(res)
-    return res_blocks
+                block[i] = new_token_id
+                del block[i + 1]
+            i += 1
+    return token_ids_blocks
+
+# from concurrent.futures import ThreadPoolExecutor
+
+# def process_block(block, a, b, new_token_id, special_ids):
+#     block = block[:]  # 浅拷贝，防止原数据被改
+#     i = 0
+#     while i < len(block):
+#         if (
+#             i < len(block) - 1 and 
+#             block[i] == a and block[i + 1] == b and 
+#             block[i] not in special_ids and block[i + 1] not in special_ids
+#         ):
+#             block[i] = new_token_id
+#             del block[i + 1]
+#         else:
+#             i += 1
+#     return block
+
+# def merge_pairs(token_ids_blocks, pair_to_merge, new_token_id, special_ids):
+#     a, b = pair_to_merge
+#     with ThreadPoolExecutor() as executor:
+#         res_blocks = list(
+#             executor.map(
+#                 lambda block: process_block(block, a, b, new_token_id, special_ids),
+#                 token_ids_blocks
+#             )
+#         )
+#     return res_blocks
+
 
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
     **kwargs,
-) -> Tuple[dict[int, bytes], List[Tuple[bytes, bytes]]]:
-    t0 = time.time()
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Given the path to an input corpus, run train a BPE tokenizer and
+    output its vocabulary and merges.
 
-    vocab, byte2id, next_token_id = bytes_vocab(special_tokens)
-    special_ids = set(byte2id[s.encode('utf-8')] for s in special_tokens)
-    merges = []
+    Args:
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+            These strings will never be split into multiple tokens, and will always be
+            kept as a single token. If these special tokens occur in the `input_path`,
+            they are treated as any other string.
 
-    with open(input_path, "rb") as f:
-        chunk = f.read()
-    token_ids_blocks = process_and_tokenize(chunk, special_tokens, PAT, byte2id)
+    Returns:
+        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+            vocab:
+                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+                to bytes (token bytes)
+            merges:
+                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+                representing that <token1> was merged with <token2>.
+                Merges are ordered by order of creation.
+    """
+    return train_bpe(input_path, vocab_size, special_tokens)
 
-    t1 = time.time()
-    print(f'The pre-tokenization runtime is {t1 - t0:.4f}s')
-    while len(vocab) < vocab_size:
-        pairs = count_pairs(token_ids_blocks, special_ids)
-        if not pairs:
-            break
-        max_freq = max(pairs.values())
+# def run_train_bpe(
+#     input_path: str | os.PathLike,
+#     vocab_size: int,
+#     special_tokens: list[str],
+#     **kwargs,
+# ) -> Tuple[dict[int, bytes], List[Tuple[bytes, bytes]]]:
+#     # t0 = time.time()
+#     base_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+#     PAT = build_pat_with_specials(special_tokens, base_pat)
+    
+#     vocab, byte2id, next_token_id = bytes_vocab(special_tokens)
+#     special_ids = set(byte2id[s.encode('utf-8')] for s in special_tokens)
+#     merges = []
+
+#     with open(input_path, "rb") as f:
+#         chunk = f.read()
+#     token_ids_blocks = process_and_tokenize(chunk, special_tokens, PAT, byte2id)
+
+#     # t1 = time.time()
+#     # print(f'The pre-tokenization runtime is {t1 - t0:.4f}s')
+#     while len(vocab) < vocab_size:
+#         pairs = count_pairs(token_ids_blocks, special_ids)
+#         if not pairs:
+#             break
+#         max_freq = max(pairs.values())
         
-        max_pairs = [pair for pair, v in pairs.items() if v == max_freq]
-        best_pair = max(
-            max_pairs, 
-            key=lambda pair: (vocab[pair[0]], vocab[pair[1]])
-        )
-        a, b = best_pair
-        ba = vocab[a] + vocab[b]
+#         max_pairs = [pair for pair, v in pairs.items() if v == max_freq]
+#         best_pair = max(
+#             max_pairs, 
+#             key=lambda pair: (vocab[pair[0]], vocab[pair[1]])
+#         )
 
-        vocab[next_token_id] = ba
+#         a, b = best_pair
+#         vocab[next_token_id] = vocab[a] + vocab[b]
         
-        merges.append((vocab[a], vocab[b]))
-        token_ids_blocks = merge_pairs(token_ids_blocks, best_pair, next_token_id, special_ids)
-        next_token_id += 1
-    t2 = time.time()
-    print(f'The loop runtime is {t2 - t1:.4f}s')
-    return vocab, merges
+#         merges.append((vocab[a], vocab[b]))
+#         token_ids_blocks = merge_pairs(token_ids_blocks, best_pair, next_token_id, special_ids)
+#         next_token_id += 1
+#     # t2 = time.time()
+#     # print(f'The loop runtime is {t2 - t1:.4f}s')
+#     # print(f'The total runtime is {t2 - t0:.4f}s')
+#     return vocab, merges
+
+def build_pat_with_specials(special_tokens: list[str], base_pat: str) -> str:
+    specials_pat = '|'.join(re.escape(tok) for tok in special_tokens)
+    if specials_pat:
+        PAT = f"(?:{specials_pat})|{base_pat}"
+    else:
+        PAT = base_pat
+    return PAT
+
+# import cppyy
+
+# cppyy.cppdef("""
+# #include <vector>
+# #include <set>
+
+# std::vector<int> merge_pair_block(
+#     const std::vector<int>& block,
+#     int a,
+#     int b,
+#     int new_token_id,
+#     const std::set<int>& special_ids
+# ) {
+#     std::vector<int> res;
+#     size_t i = 0, n = block.size();
+#     while (i < n) {
+#         if (
+#             i < n - 1 &&
+#             block[i] == a && block[i+1] == b &&
+#             special_ids.find(block[i]) == special_ids.end() &&
+#             special_ids.find(block[i+1]) == special_ids.end()
+#         ) {
+#             res.push_back(new_token_id);
+#             i += 2;
+#         } else {
+#             res.push_back(block[i]);
+#             i += 1;
+#         }
+#     }
+#     return res;
+# }
+# """)
+
+# def merge_pairs_cppyy(token_ids_blocks, pair_to_merge, new_token_id, special_ids):
+#     a, b = pair_to_merge
+#     cxx_special = cppyy.gbl.std.set[int]()
+#     for x in special_ids:
+#         cxx_special.insert(x)
+        
+#     res_blocks = []
+#     for block in token_ids_blocks:
+#         cxx_block = cppyy.gbl.std.vector[int]()
+#         for num in block:
+#             cxx_block.push_back(num)
+#         res = cppyy.gbl.merge_pair_block(cxx_block, a, b, new_token_id, cxx_special)
+#         py_res = [int(res[i]) for i in range(res.size())]
+#         res_blocks.append(py_res)
+#     return res_blocks
