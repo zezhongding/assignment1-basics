@@ -15,8 +15,6 @@ import regex as re
 from typing import BinaryIO
 from typing import List, Dict, Tuple
 from concurrent.futures import ProcessPoolExecutor
-# from numba import njit
-
 
 def find_chunk_boundaries(
     file: BinaryIO, 
@@ -764,116 +762,229 @@ def get_tokenizer(
 
 #     return vocab, merges
 import time
-def bytes_vocab(special_tokens: List[str]) -> Tuple[dict[int, bytes], dict[bytes, int], int]:
-    vocab = {}
-    byte2id = {}
-    for i, tok in enumerate(special_tokens):
-        token_byte = tok.encode('utf-8')
-        vocab[i] = token_byte
-        byte2id[token_byte] = i
-    for i in range(256):
-        b = bytes([i])
-        idx = len(vocab)
-        vocab[idx] = b
-        byte2id[b] = idx
-    next_token_id = len(vocab)
-    return vocab, byte2id, next_token_id
-
-def process_and_tokenize(chunk: bytes, special_tokens: List[str], PAT: str, byte2id: dict) -> List[List[int]]:
-    text = chunk.decode("utf-8", errors="ignore")
-    for tok in special_tokens:
-        text = text.replace(tok, f"<@_{tok}_@>")
-    units = re.findall(PAT, text)
-    ids = []
-    for u in units:
-        if not u:
-            continue
-        orig = u
-        # 恢复特殊token
-        for st in special_tokens:
-            if u == f"<@_{st}_@>":
-                orig = st
-        if orig in special_tokens:
-            b = orig.encode('utf-8')
-            tid = byte2id.get(b)
-            if tid is None:
-                raise RuntimeError(f"Special token {orig} is not in byte2id")
-            ids.append([tid])
-        else:
-            bs = orig.encode("utf-8")
-            ids.append([byte2id[bytes([b])] for b in bs])
-    return ids
-
-def count_pairs(token_ids_blocks: List[List[int]], special_ids: set[int]) -> Counter:
-    c = Counter()
-    for block in token_ids_blocks:
-        for i in range(len(block)-1):
-            a, b = block[i], block[i+1]
-            if a in special_ids or b in special_ids:
-                continue
-            c[(a, b)] += 1
-    return c
-
-def merge_pairs(token_ids_blocks: List[List[int]], pair_to_merge: Tuple[int, int], new_token_id: int, special_ids: set[int]) -> List[List[int]]:
-    res_blocks = []
-    a, b = pair_to_merge
-    for block in token_ids_blocks:
-        res = []
-        i = 0
-        while i < len(block):
-            if (
-                i < len(block) - 1 and
-                block[i] == a and
-                block[i+1] == b and
-                block[i] not in special_ids and
-                block[i+1] not in special_ids
-            ):
-                res.append(new_token_id)
-                i += 2
-            else:
-                res.append(block[i])
-                i += 1
-        res_blocks.append(res)
-    return res_blocks
-
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
     **kwargs,
-) -> Tuple[dict[int, bytes], List[Tuple[bytes, bytes]]]:
-    t0 = time.time()
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Given the path to an input corpus, run train a BPE tokenizer and
+    output its vocabulary and merges.
+
+    Args:
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+            These strings will never be split into multiple tokens, and will always be
+            kept as a single token. If these special tokens occur in the `input_path`,
+            they are treated as any other string.
+
+    Returns:
+        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+            vocab:
+                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+                to bytes (token bytes)
+            merges:
+                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+                representing that <token1> was merged with <token2>.
+                Merges are ordered by order of creation.
+    """
+    """Train a BPE tokenizer with vocab: [special tokens] + [256 bytes] + [merge tokens]."""
+
+
+    num_processes = 128
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    specials_bytes_set = set(st.encode('utf-8') for st in special_tokens)
 
-    vocab, byte2id, next_token_id = bytes_vocab(special_tokens)
-    special_ids = set(byte2id[s.encode('utf-8')] for s in special_tokens)
-    merges = []
-
+    # 1. 切chunk & 处理为token序列
+    t0 = time.perf_counter()
     with open(input_path, "rb") as f:
-        chunk = f.read()
-    token_ids_blocks = process_and_tokenize(chunk, special_tokens, PAT, byte2id)
+        boundaries = find_chunk_boundaries(
+            f, num_processes, "<|endoftext|>".encode("utf-8"))
+        chunks = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start)
+            chunks.append(chunk)
+
+    # 并行tokenize（每个chunk为一个token_seq_list）
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        token_seqs_blocks = list(executor.map(
+            process_and_tokenize,
+            chunks,
+            [special_tokens]*len(chunks),
+            [PAT]*len(chunks)
+        ))
+    t1 = time.perf_counter()
+    print(f"处理token序列耗时：{t1 - t0:.4f}秒")
+
+
+    # 2. 每一轮 BPE
+    t0 = time.time()
+    vocab = {}
+    for i, tok in enumerate(special_tokens):
+        vocab[i] = tok.encode('utf-8')
+    for i in range(256):
+        vocab[len(special_tokens) + i] = bytes([i])
+    merges: List[Tuple[bytes, bytes]] = []
+    next_token_id = len(vocab)
+
+
+
+    # 主循环
+    # with ProcessPoolExecutor(max_workers=1) as executor:
+    #     while len(vocab) < vocab_size:
+    #         # 2.1 多进程统计pair
+    #         results = list(executor.map(
+    #             count_pairs,
+    #             token_seqs_blocks,
+    #             [specials_bytes_set] * len(token_seqs_blocks),
+    #         ))
+    #         global_pairs = Counter()
+    #         for c in results:
+    #             global_pairs.update(c)
+
+    #         if not global_pairs:
+    #             break
+            
+    #         # 2.2 选最大出现的pair
+    #         max_freq = max(global_pairs.values())
+    #         mosts = [k for k, v in global_pairs.items() if v == max_freq]
+    #         best_pair = max(mosts)  # 可自由确定tie-break方式
+
+    #         merges.append(best_pair)
+    #         merged_token = best_pair[0] + best_pair[1]
+    #         if merged_token not in vocab.values():
+    #             vocab[next_token_id] = merged_token
+    #             next_token_id += 1
+
+    #         # 2.3 多进程全局同步替换
+    #         token_seqs_blocks = list(executor.map(
+    #             merge_pair_in_chunk,
+    #             token_seqs_blocks,
+    #             [best_pair]*len(token_seqs_blocks),
+    #             [specials_bytes_set]*len(token_seqs_blocks),
+    #         ))
+
+    while len(vocab) < vocab_size:
+        global_pairs = Counter()
+        for block in token_seqs_blocks:
+            global_pairs.update(count_pairs(block, specials_bytes_set))
+
+        if not global_pairs:
+            break
+
+        max_freq = max(global_pairs.values())
+        mosts = [k for k, v in global_pairs.items() if v == max_freq]
+        best_pair = max(mosts)
+        merges.append(best_pair)
+        merged_token = best_pair[0] + best_pair[1]
+        if merged_token not in vocab.values():
+            vocab[next_token_id] = merged_token
+            next_token_id += 1
+
+        # in-place替换更节省内存（如果可以的话）
+        for i in range(len(token_seqs_blocks)):
+            token_seqs_blocks[i] = merge_pair_in_chunk(
+                token_seqs_blocks[i], best_pair, specials_bytes_set
+            )
+
 
     t1 = time.time()
-    print(f'The pre-tokenization runtime is {t1 - t0:.4f}s')
-    while len(vocab) < vocab_size:
-        pairs = count_pairs(token_ids_blocks, special_ids)
-        if not pairs:
-            break
-        max_freq = max(pairs.values())
-        
-        max_pairs = [pair for pair, v in pairs.items() if v == max_freq]
-        best_pair = max(
-            max_pairs, 
-            key=lambda pair: (vocab[pair[0]], vocab[pair[1]])
-        )
-        a, b = best_pair
-        ba = vocab[a] + vocab[b]
+    print(f"循环内部时间：{t1 - t0:.4f}秒")
 
-        vocab[next_token_id] = ba
-        
-        merges.append((vocab[a], vocab[b]))
-        token_ids_blocks = merge_pairs(token_ids_blocks, best_pair, next_token_id, special_ids)
-        next_token_id += 1
-    t2 = time.time()
-    print(f'The loop runtime is {t2 - t1:.4f}s')
     return vocab, merges
+
+
+
+
+def process_chunk(chunk: bytes, special_tokens: List[str], PAT: str) -> Counter:
+    """对每一个划分的 chunk 统计pair频数，只返回Counter。"""
+    text = chunk.decode("utf-8", errors="ignore")
+
+    # 替换special token为占位
+    special_token_map = {}
+    for idx, tok in enumerate(special_tokens):
+        placeholder = f"<@_SPECIAL{idx}_@>"
+        text = text.replace(tok, placeholder)
+        special_token_map[placeholder] = tok
+
+    # 切分
+    units = []
+    for part in re.findall(PAT, text):
+        if part in special_token_map:
+            units.append(special_token_map[part])
+        elif part:
+            units.append(part)
+
+    # 按bytes分片
+    token_seqs = []
+    for unit in units:
+        if unit in special_tokens:
+            token_seqs.append([unit.encode('utf-8')])
+        else:
+            token_seqs.append([bytes([b]) for b in unit.encode('utf-8')])
+
+    # pair统计
+    pairs = Counter()
+    specials_set = set(st.encode("utf-8") for st in special_tokens)
+    for seq in token_seqs:
+        if len(seq) == 1 and seq[0] in specials_set:
+            continue
+        for i in range(len(seq) - 1):
+            pair = (seq[i], seq[i + 1])
+            pairs[pair] += 1
+
+    return pairs
+
+
+def process_and_tokenize(chunk: bytes, special_tokens: List[str], PAT: str) -> List[List[bytes]]:
+    """对文本块进行分句、分词，转为token序列（list[list[bytes]])"""
+    text = chunk.decode("utf-8", errors="ignore")
+    special_token_map = {}
+    for idx, tok in enumerate(special_tokens):
+        placeholder = f"<@_SPECIAL{idx}_@>"
+        text = text.replace(tok, placeholder)
+        special_token_map[placeholder] = tok
+    units = []
+    for part in re.findall(PAT, text):
+        if part in special_token_map:
+            units.append(special_token_map[part])
+        elif part:
+            units.append(part)
+    token_seqs = []
+    for unit in units:
+        if unit in special_tokens:
+            token_seqs.append([unit.encode("utf-8")])
+        else:
+            token_seqs.append([bytes([b]) for b in unit.encode("utf-8")])
+    return token_seqs
+
+def count_pairs(token_seqs_chunk: List[List[bytes]], specials: set) -> Counter:
+    """统计chunk内pair频率"""
+    pairs = Counter()
+    for seq in token_seqs_chunk:
+        if len(seq) == 1 and seq[0] in specials:
+            continue
+        for i in range(len(seq) - 1):
+            pairs[(seq[i], seq[i+1])] += 1
+    return pairs
+
+def merge_pair_in_chunk(token_seqs_chunk: List[List[bytes]], pair_to_merge: Tuple[bytes,bytes], specials: set) -> List[List[bytes]]:
+    """chunk内部合并最多对"""
+    out = []
+    for seq in token_seqs_chunk:
+        if len(seq) == 1 and seq[0] in specials:
+            out.append(seq)
+            continue
+        new_seq = []
+        i = 0
+        while i < len(seq):
+            if i < len(seq) - 1 and (seq[i], seq[i+1]) == pair_to_merge:
+                new_seq.append(seq[i] + seq[i+1])
+                i += 2
+            else:
+                new_seq.append(seq[i])
+                i += 1
+        out.append(new_seq)
+    return out
